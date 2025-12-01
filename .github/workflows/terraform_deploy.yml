@@ -1,0 +1,158 @@
+name: Terraform Deploy
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+
+jobs:
+  Build:
+    runs-on: ubuntu-latest
+    environment: ${{ github.ref_name == 'main' && 'Production' || github.ref_name == 'develop' && 'Development' }}
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+
+      - name: Read version
+        id: version
+        run: |
+          VERSION=$(cat VERSION)
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT }}:role/gh-actions-role
+          aws-region: us-west-2
+
+      - name: Login to AWS ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build & Push Docker Image
+        id: build-image
+        run: |
+          VERSION=${{ steps.version.outputs.version }}
+          ECR_REPO=hello-world-app-${{ vars.ENV }}
+
+          docker build -t $ECR_REPO:$VERSION app/
+          docker tag $ECR_REPO:$VERSION  ${{ steps.login-ecr.outputs.registry }}/$ECR_REPO:$VERSION 
+          docker push ${{ steps.login-ecr.outputs.registry }}/$ECR_REPO:$VERSION 
+
+          echo "image_tag=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Save image tag
+        run: echo "${{ steps.build-image.outputs.image_tag }}" > dummy.txt
+
+
+      - name: Upload image tag artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-tag-${{ github.sha }}
+          path: ./dummy.txt
+          retention-days: 1
+
+  Terraform_Plan:
+    needs: Build
+    runs-on: ubuntu-latest
+    environment: ${{ github.ref_name == 'main' && 'Production' || github.ref_name == 'develop' && 'Development' }}
+    permissions:
+      id-token: write
+      contents: read
+      
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+      
+      - name: Download image tag
+        uses: actions/download-artifact@v4
+        with:
+          name: image-tag-${{ github.sha }}
+          path: .
+      
+      - name: Read image tag
+        id: read-tag
+        run: echo "image_tag=$(cat dummy.txt)" >> $GITHUB_OUTPUT
+
+      - name: Version
+        id: version
+        run: |
+          VERSION=$(cat VERSION)
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT }}:role/gh-actions-role
+          aws-region: us-west-2
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+
+      - name: Terraform Init
+        working-directory: infra
+        run: |
+          terraform init \
+            -backend-config="key=${{ vars.COMPONENT }}/${{ vars.ENV }}/terraform.tfstate"
+      
+      - name: Terraform Plan
+        id: plan
+        working-directory: infra
+        env:
+          TF_VAR_environment: ${{ vars.ENV }}
+          TF_VAR_component_version: ${{ steps.version.outputs.version }}
+          TF_VAR_aws_account: ${{ vars.AWS_ACCOUNT }}
+          TF_VAR_image_tag: ${{ steps.read-tag.outputs.image_tag }}
+        run: |
+          terraform plan -out=tfplan
+
+      - name: Upload Terraform Plan Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-plan-${{ github.sha }}
+          path: infra/tfplan 
+          retention-days: 1 
+
+  
+  Terraform_Apply:
+    needs: Terraform_Plan
+    runs-on: ubuntu-latest
+    environment: ${{ github.ref_name == 'main' && 'Production' || github.ref_name == 'develop' && 'Development' }}
+    permissions:
+      id-token: write
+      contents: read
+      
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+        
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT }}:role/gh-actions-role
+          aws-region: us-west-2
+      
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+
+      - name: Download Terraform Plan Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: terraform-plan-${{ github.sha }}
+          path: infra/
+
+      - name: Terraform Init
+        working-directory: infra
+        run: |
+          terraform init \
+            -backend-config="key=${{ vars.COMPONENT }}/${{ vars.ENV }}/terraform.tfstate"
+      
+      - name: Terraform Apply
+        working-directory: infra
+        run: | 
+          terraform apply -auto-approve tfplan
